@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, ConfigDict
 
 StepId = Union[str, int]
 TipId = Union[str, int]
+SourceId = Union[str, int]
 
 
 class ComponentInput(BaseModel):
@@ -22,6 +23,10 @@ class InitialLiquidInput(BaseModel):
     well: str
     volume: float
     components: list[ComponentInput] = Field(default_factory=list)
+    # Provenance of the starting liquid. When omitted the liquid is treated as
+    # undeclared background volume, which keeps legacy requests unchanged.
+    sample_id: Optional[SourceId] = None
+    lot_id: Optional[SourceId] = None
 
 
 class PlateTypeInput(BaseModel):
@@ -67,6 +72,24 @@ class TargetThreshold(BaseModel):
     threshold: float = 1e-6
 
 
+class AllowedSourceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # A rule matches a packet source when every provided identifier is equal;
+    # an empty rule ({}) acts as a wildcard allowing every source.
+    sample_id: Optional[SourceId] = None
+    lot_id: Optional[SourceId] = None
+
+
+class SourceThresholdInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    well: str
+    allowed_sources: Optional[list[AllowedSourceInput]] = None
+    # Maximum share of liquid originating from a non-allowed source.
+    max_foreign_fraction: float = 0.0
+
+
 class ProgramInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -77,6 +100,7 @@ class ProgramInput(BaseModel):
     residual_rate: Optional[float] = None
     steps: list[StepInput] = Field(default_factory=list)
     targets: list[TargetThreshold] = Field(default_factory=list)
+    source_targets: list[SourceThresholdInput] = Field(default_factory=list)
 
 
 class ReviewRequest(BaseModel):
@@ -84,6 +108,7 @@ class ReviewRequest(BaseModel):
 
     program: ProgramInput
     targets: list[TargetThreshold] = Field(default_factory=list)
+    source_targets: list[SourceThresholdInput] = Field(default_factory=list)
     report_trace: bool = True
 
 
@@ -93,6 +118,7 @@ class CompareRequest(BaseModel):
     version_a: ProgramInput
     version_b: ProgramInput
     targets: list[TargetThreshold] = Field(default_factory=list)
+    source_targets: list[SourceThresholdInput] = Field(default_factory=list)
     find_blockers: bool = True
     max_blocker_candidates: int = 40
 
@@ -103,6 +129,13 @@ def _finite_number(value: Any) -> bool:
 
 def _positive_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _source_identifier(value: Any) -> bool:
+    """A provenance identifier is a non-empty string or a non-boolean integer."""
+    return (isinstance(value, str) and bool(value.strip())) or (
+        isinstance(value, int) and not isinstance(value, bool)
+    )
 
 
 def validation_error(
@@ -157,7 +190,11 @@ def _validate_rate(value: Any, field: str, step: Optional[StepInput] = None, ind
     return errors
 
 
-def validate_program(program: ProgramInput, extra_targets: Optional[list[TargetThreshold]] = None) -> list[dict[str, Any]]:
+def validate_program(
+    program: ProgramInput,
+    extra_targets: Optional[list[TargetThreshold]] = None,
+    extra_source_targets: Optional[list["SourceThresholdInput"]] = None,
+) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     plate = program.plate
     wells = plate_wells(plate)
@@ -198,6 +235,24 @@ def validate_program(program: ProgramInput, extra_targets: Optional[list[TargetT
             errors.append(validation_error("UNKNOWN_WELL", f"Well {initial.well} does not exist on the plate.", f"{prefix}.well"))
         if not _finite_number(initial.volume) or initial.volume < 0:
             errors.append(validation_error("NEGATIVE_VOLUME", "Initial volume must be non-negative.", f"{prefix}.volume"))
+        sample_id = getattr(initial, "sample_id", None)
+        lot_id = getattr(initial, "lot_id", None)
+        if sample_id is not None and not _source_identifier(sample_id):
+            errors.append(
+                validation_error(
+                    "INVALID_SOURCE_ID",
+                    "sample_id must be a non-empty string or an integer.",
+                    f"{prefix}.sample_id",
+                )
+            )
+        if lot_id is not None and not _source_identifier(lot_id):
+            errors.append(
+                validation_error(
+                    "INVALID_SOURCE_ID",
+                    "lot_id must be a non-empty string or an integer.",
+                    f"{prefix}.lot_id",
+                )
+            )
         component_sum = 0.0
         seen_components: set[str] = set()
         for j, component in enumerate(initial.components):
@@ -275,4 +330,64 @@ def validate_program(program: ProgramInput, extra_targets: Optional[list[TargetT
         if not _finite_number(target.threshold) or target.threshold < 0:
             errors.append(validation_error("INVALID_THRESHOLD", "threshold must be non-negative.", f"targets.{i}.threshold"))
 
+    all_source_targets = list(getattr(program, "source_targets", []) or []) + list(extra_source_targets or [])
+    seen_source_targets: set[str] = set()
+    for i, target in enumerate(all_source_targets):
+        if target.well in seen_source_targets:
+            errors.append(
+                validation_error(
+                    "DUPLICATE_SOURCE_TARGET",
+                    f"Duplicate source target for well {target.well}.",
+                    f"source_targets.{i}",
+                )
+            )
+        seen_source_targets.add(target.well)
+        if target.well not in wells:
+            errors.append(
+                validation_error(
+                    "UNKNOWN_WELL",
+                    f"Source target well {target.well} does not exist.",
+                    f"source_targets.{i}.well",
+                )
+            )
+        if not _finite_number(target.max_foreign_fraction) or not (0.0 <= target.max_foreign_fraction <= 1.0):
+            errors.append(
+                validation_error(
+                    "INVALID_THRESHOLD",
+                    "max_foreign_fraction must be a finite number between 0 and 1.",
+                    f"source_targets.{i}.max_foreign_fraction",
+                )
+            )
+        if target.allowed_sources is not None:
+            for j, allowed in enumerate(target.allowed_sources):
+                sample_id = allowed.sample_id
+                lot_id = allowed.lot_id
+                if sample_id is not None and not _source_identifier(sample_id):
+                    errors.append(
+                        validation_error(
+                            "INVALID_SOURCE_ID",
+                            "allowed_sources sample_id must be a non-empty string or an integer.",
+                            f"source_targets.{i}.allowed_sources.{j}.sample_id",
+                        )
+                    )
+                if lot_id is not None and not _source_identifier(lot_id):
+                    errors.append(
+                        validation_error(
+                            "INVALID_SOURCE_ID",
+                            "allowed_sources lot_id must be a non-empty string or an integer.",
+                            f"source_targets.{i}.allowed_sources.{j}.lot_id",
+                        )
+                    )
+
     return errors
+
+
+def merge_source_targets(
+    program: ProgramInput,
+    extra: Optional[list["SourceThresholdInput"]] = None,
+) -> list["SourceThresholdInput"]:
+    """Program-level rules win over request-level rules for the same target well."""
+    merged: dict[str, "SourceThresholdInput"] = {}
+    for target in list(extra or []) + list(getattr(program, "source_targets", []) or []):
+        merged[target.well] = target
+    return list(merged.values())

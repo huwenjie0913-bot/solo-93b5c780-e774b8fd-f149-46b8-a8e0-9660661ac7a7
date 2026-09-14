@@ -9,6 +9,7 @@ from .models import (
     InitialLiquidInput,
     PlateTypeInput,
     ProgramInput,
+    SourceThresholdInput,
     StepId,
     StepInput,
     TargetThreshold,
@@ -28,6 +29,15 @@ class Packet:
     volume: float
     node: int
     history: tuple[dict[str, Any], ...]
+    # Provenance inherited from the originating initial liquid. None means the
+    # source was not declared (legacy liquid); such packets are never counted as
+    # "foreign" so requests without source fields keep their original behaviour.
+    sample_id: Optional[Any] = None
+    lot_id: Optional[Any] = None
+
+    @property
+    def declared(self) -> bool:
+        return self.sample_id is not None or self.lot_id is not None
 
 
 class Graph:
@@ -164,12 +174,18 @@ class Simulator:
         interventions: Optional[dict[StepId, str]] = None,
         report_trace: bool = True,
         max_blocker_candidates: int = 40,
+        source_targets: Optional[list[SourceThresholdInput]] = None,
     ) -> None:
         self.program = program
         self.targets = list(targets or [])
         self.interventions = interventions or {}
         self.report_trace = report_trace
         self.max_blocker_candidates = max_blocker_candidates
+        program_source_targets = list(getattr(program, "source_targets", None) or [])
+        merged_source: dict[str, SourceThresholdInput] = {}
+        for source_target in list(source_targets or []) + program_source_targets:
+            merged_source[source_target.well] = source_target
+        self.source_targets = list(merged_source.values())
 
         self.graph = Graph()
         self.wells = plate_wells(program.plate)
@@ -184,6 +200,14 @@ class Simulator:
         self.trace: list[dict[str, Any]] = []
         self.cross_events: list[dict[str, Any]] = []
         self.first_cross: dict[tuple[str, str], dict[str, Any]] = {}
+        # Provenance-level accounting: source identity is (sample_id, lot_id)
+        # and survives every transfer, so identical component names such as
+        # "DNA" are still distinguishable across samples.
+        self.source_cross_events: list[dict[str, Any]] = []
+        self.first_source_cross: dict[tuple[str, Any], dict[str, Any]] = {}
+        self.initial_source_components: dict[str, dict[tuple[Any, Any], dict[str, float]]] = {
+            well: {} for well in self.wells
+        }
         self.candidate_nodes: dict[int, dict[str, Any]] = {}
         self.finding_seq = 0
         self.lot_seq = 0
@@ -244,6 +268,8 @@ class Simulator:
             volume=float(clean_volume),
             node=node,
             history=packet.history + (event,),
+            sample_id=packet.sample_id,
+            lot_id=packet.lot_id,
         )
 
     def well_total(self, well: str) -> float:
@@ -259,21 +285,68 @@ class Simulator:
             totals[packet.component] = totals.get(packet.component, 0.0) + packet.volume
         return {name: volume for name, volume in totals.items() if volume > 1e-11}
 
+    @staticmethod
+    def source_key(packet: Packet) -> tuple[Any, Any]:
+        return (packet.sample_id, packet.lot_id)
+
+    @staticmethod
+    def source_label(key: tuple[Any, Any]) -> dict[str, Any]:
+        sample_id, lot_id = key
+        return {"sample_id": sample_id, "lot_id": lot_id}
+
+    def source_groups(self, packets: dict[Any, Packet], only_declared: bool = False) -> dict[tuple[Any, Any], dict[str, Any]]:
+        """Aggregate volume per declared source, with a per-component breakdown."""
+        groups: dict[tuple[Any, Any], dict[str, Any]] = {}
+        for packet in packets.values():
+            if packet.volume <= 1e-11:
+                continue
+            if only_declared and not packet.declared:
+                continue
+            key = self.source_key(packet)
+            group = groups.setdefault(key, {"volume": 0.0, "components": {}})
+            group["volume"] += packet.volume
+            group["components"][packet.component] = group["components"].get(packet.component, 0.0) + packet.volume
+        for group in groups.values():
+            group["components"] = {
+                name: volume for name, volume in group["components"].items() if volume > 1e-11
+            }
+        return {key: group for key, group in groups.items() if group["volume"] > 1e-11}
+
+    def composition(self, packets: dict[Any, Packet]) -> list[dict[str, Any]]:
+        groups = self.source_groups(packets, only_declared=True)
+        return [
+            {
+                **self.source_label(key),
+                "volume": group["volume"],
+                "components": group["components"],
+            }
+            for key, group in sorted(groups.items(), key=lambda item: -item[1]["volume"])
+        ]
+
     def well_snapshot(self, well: str) -> dict[str, Any]:
-        return {
+        snapshot = {
             "volume": self.well_total(well),
             "capacity": self.wells[well],
             "components": self.component_totals(self.well_packets[well]),
         }
+        # Provenance is only attached when the request actually declared sources,
+        # so legacy snapshots remain byte-for-byte identical.
+        if any(p.declared for p in self.well_packets[well].values()):
+            snapshot["source_composition"] = self.composition(self.well_packets[well])
+        return snapshot
 
     def tip_snapshot(self, tip: Optional[str] = None) -> dict[str, Any]:
         tip = tip or self.active_tip
-        return {
+        store = self.tip_packets.setdefault(tip, {})
+        snapshot = {
             "tip_id": tip,
             "volume": self.tip_total(tip),
             "capacity": self.tip_capacity,
-            "components": self.component_totals(self.tip_packets.setdefault(tip, {})),
+            "components": self.component_totals(store),
         }
+        if any(p.declared for p in store.values()):
+            snapshot["source_composition"] = self.composition(store)
+        return snapshot
 
     def initialize(self) -> None:
         for initial in self.program.initial_liquids:
@@ -300,6 +373,8 @@ class Simulator:
             else:
                 component_inputs = [("*", requested)] if requested > EPS else []
 
+            sample_id = getattr(initial, "sample_id", None)
+            lot_id = getattr(initial, "lot_id", None)
             scale = actual_request / requested if requested > EPS else 0.0
             for name, component_volume in component_inputs:
                 volume = max(0.0, component_volume * scale)
@@ -315,13 +390,28 @@ class Simulator:
                     "well": well,
                     "component": name,
                     "volume": volume,
+                    "sample_id": sample_id,
+                    "lot_id": lot_id,
                 }
-                packet = Packet(lot, name, well, volume, node, (event,))
+                packet = Packet(
+                    lot,
+                    name,
+                    well,
+                    volume,
+                    node,
+                    (event,),
+                    sample_id=sample_id,
+                    lot_id=lot_id,
+                )
                 self.graph.add_edge(self.graph.source, node, GRAPH_INF, {"kind": "initial_lot"})
                 self.put_well_packet(well, packet)
                 self.native_components[well].add(name)
                 self.initial_components[well][name] = self.initial_components[well].get(name, 0.0) + volume
                 self.initial_volumes[well] += volume
+                if packet.declared:
+                    source_map = self.initial_source_components[well]
+                    component_map = source_map.setdefault(self.source_key(packet), {})
+                    component_map[name] = component_map.get(name, 0.0) + volume
 
         # The simulation graph is built from initial packets and every packet
         # transfer; target threshold evaluation determines the sink edges.
@@ -373,6 +463,88 @@ class Simulator:
         if first:
             self.first_cross[key] = event
 
+    def source_rule_for(self, well: str) -> Optional[SourceThresholdInput]:
+        for rule in self.source_targets:
+            if rule.well == well:
+                return rule
+        return None
+
+    def source_is_allowed(self, key: tuple[Any, Any], rule: SourceThresholdInput, well: str) -> bool:
+        sample_id, lot_id = key
+        rules = rule.allowed_sources
+        if rules is None:
+            # Without an explicit allow list the well's own initially declared
+            # sources are the only accepted provenance.
+            return key in self.initial_source_components[well]
+        for entry in rules:
+            entry_sample = entry.sample_id
+            entry_lot = entry.lot_id
+            if entry_sample is None and entry_lot is None:
+                # An empty rule ({}) is a wildcard.
+                return True
+            if entry_sample is not None and entry_sample != sample_id:
+                continue
+            if entry_lot is not None and entry_lot != lot_id:
+                continue
+            return True
+        return False
+
+    def serialize_allowed_sources(self, rule: SourceThresholdInput) -> list[dict[str, Any]]:
+        if rule.allowed_sources is None:
+            return [
+                self.source_label(key)
+                for key in sorted(self.initial_source_components[rule.well], key=repr)
+            ]
+        return [{"sample_id": entry.sample_id, "lot_id": entry.lot_id} for entry in rule.allowed_sources]
+
+    def record_source_cross(
+        self,
+        step: StepInput,
+        index: int,
+        well: str,
+        packet: Packet,
+        volume: float,
+        well_before: float,
+        well_after: float,
+        mechanism: str,
+        cycle: Optional[int] = None,
+    ) -> None:
+        if volume <= EPS or not packet.declared or packet.origin_well == well:
+            return
+        rule = self.source_rule_for(well)
+        if rule is None:
+            return
+        key = (well, self.source_key(packet))
+        if self.source_is_allowed(self.source_key(packet), rule, well):
+            return
+        first = key not in self.first_source_cross
+        event = {
+            "code": "SOURCE_CROSS_CONTAMINATION",
+            "severity": "warning",
+            "message": (
+                f"Source {self.source_label(self.source_key(packet))} from {packet.origin_well} "
+                f"(component {packet.component}) is not an allowed source of {well}."
+            ),
+            **self.step_meta(step, index),
+            "mechanism": mechanism,
+            "cycle": cycle,
+            "target_well": well,
+            "sample_id": packet.sample_id,
+            "lot_id": packet.lot_id,
+            "component": packet.component,
+            "origin_well": packet.origin_well,
+            "volume": volume,
+            "well_volume_before": well_before,
+            "well_volume_after": well_after,
+            "fraction_after": volume / well_after if well_after > EPS else 0.0,
+            "first_occurrence": first,
+            "arrival_node": self.graph.reverse[packet.node],
+            "propagation_chain": list(packet.history),
+        }
+        self.source_cross_events.append(event)
+        if first:
+            self.first_source_cross[key] = event
+
     def remove_proportional(self, store: dict[Any, Packet], amount: float) -> tuple[list[Packet], float]:
         total = sum(p.volume for p in store.values())
         if amount <= EPS or total <= EPS:
@@ -396,6 +568,8 @@ class Simulator:
                     part,
                     packet.node,
                     packet.history,
+                    sample_id=packet.sample_id,
+                    lot_id=packet.lot_id,
                 )
             )
         for key in empty_keys:
@@ -497,7 +671,11 @@ class Simulator:
                 "actual_volume": packet.volume,
             }
             moved = self.clone_packet(packet, packet.volume, drawn_node, event)
-            self.graph.add_edge(packet.node, drawn_node)
+            # Liquid drawn from the source well enters the tip *through* this
+            # step's boundary; cutting it (fresh tip / full wash) must prevent
+            # source-well liquid from joining the tip's prior contents.
+            self.graph.add_edge(packet.node, boundary)
+            self.graph.add_edge(boundary, drawn_node)
             self.put_tip_packet(tip, moved)
 
         self.trace.append(
@@ -616,6 +794,8 @@ class Simulator:
                 accepted_volume,
                 packet.node,
                 packet.history,
+                sample_id=packet.sample_id,
+                lot_id=packet.lot_id,
             )
             after_node = self.graph.node(
                 f"well:{target}:lot:{packet.lot}:after:{step.id}:{cycle or 0}"
@@ -624,6 +804,17 @@ class Simulator:
             self.put_well_packet(target, accepted)
             well_after = self.well_total(target)
             self.record_cross_contamination(
+                step,
+                index,
+                target,
+                accepted,
+                accepted_volume,
+                well_before,
+                well_after,
+                mechanism,
+                cycle,
+            )
+            self.record_source_cross(
                 step,
                 index,
                 target,
@@ -863,10 +1054,114 @@ class Simulator:
             )
         return snapshots
 
+    def evaluate_source_targets(
+        self, step_id: Optional[StepId] = None, step_index: Optional[int] = None
+    ) -> list[dict[str, Any]]:
+        snapshots = []
+        for rule in self.source_targets:
+            well = rule.well
+            volume = self.well_total(well)
+            groups = self.source_groups(self.well_packets[well], only_declared=True)
+            allowed_volume = 0.0
+            foreign_volume = 0.0
+            foreign_sources: dict[tuple[Any, Any], dict[str, Any]] = {}
+            allowed_sources: list[dict[str, Any]] = []
+            for key, group in groups.items():
+                label = self.source_label(key)
+                entry = {**label, "volume": group["volume"], "components": group["components"]}
+                if self.source_is_allowed(key, rule, well):
+                    allowed_volume += group["volume"]
+                    allowed_sources.append(entry)
+                else:
+                    foreign_volume += group["volume"]
+                    foreign_sources[key] = entry
+            fraction = foreign_volume / volume if volume > EPS else 0.0
+            ordered_foreign = [
+                foreign_sources[key]
+                for key in sorted(foreign_sources, key=lambda item: -foreign_sources[item]["volume"])
+            ]
+            snapshots.append(
+                {
+                    "well": well,
+                    "step_id": step_id,
+                    "step_index": step_index,
+                    "well_volume": volume,
+                    "allowed_sources": self.serialize_allowed_sources(rule),
+                    "foreign_volume": foreign_volume,
+                    "foreign_fraction": fraction,
+                    "max_foreign_fraction": rule.max_foreign_fraction,
+                    "composition": {
+                        "allowed": allowed_sources,
+                        "foreign": ordered_foreign,
+                        "undeclared_volume": volume - allowed_volume - foreign_volume,
+                    },
+                    "observed_foreign_source": ordered_foreign[0] if ordered_foreign else None,
+                    "qualified": fraction <= rule.max_foreign_fraction + EPS,
+                    "basis": "foreign_fraction = volume from non-allowed declared sources / total well volume",
+                }
+            )
+        return snapshots
+
+    def evaluate_initial_source_snapshot(self, rule: SourceThresholdInput) -> dict[str, Any]:
+        well = rule.well
+        volume = self.initial_volumes[well]
+        source_components = self.initial_source_components[well]
+        foreign_volume = 0.0
+        foreign_sources: list[dict[str, Any]] = []
+        for key, components in source_components.items():
+            source_volume = sum(components.values())
+            if not self.source_is_allowed(key, rule, well):
+                foreign_volume += source_volume
+                foreign_sources.append({**self.source_label(key), "volume": source_volume, "components": dict(components)})
+        fraction = foreign_volume / volume if volume > EPS else 0.0
+        foreign_sources.sort(key=lambda entry: -entry["volume"])
+        return {
+            "well_volume": volume,
+            "foreign_volume": foreign_volume,
+            "foreign_fraction": fraction,
+            "foreign_sources": foreign_sources,
+            "observed_foreign_source": foreign_sources[0] if foreign_sources else None,
+            "qualified": fraction <= rule.max_foreign_fraction + EPS,
+        }
+
+    def source_chain_for(
+        self, rule: SourceThresholdInput, observed: Optional[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Resolve the complete propagation chain for a foreign source."""
+        if observed is None:
+            return {"event": None, "chain": [], "blockable": True}
+        key = (rule.well, (observed["sample_id"], observed["lot_id"]))
+        event = self.first_source_cross.get(key)
+        if event is not None:
+            return {"event": event, "chain": event["propagation_chain"], "blockable": True}
+        # A foreign source present from initialization cannot be removed mid-run.
+        initial = self.evaluate_initial_source_snapshot(rule)
+        if initial["foreign_volume"] > EPS:
+            return {
+                "event": {
+                    "step_id": None,
+                    "target_well": rule.well,
+                    "sample_id": observed["sample_id"],
+                    "lot_id": observed["lot_id"],
+                },
+                "chain": [
+                    {
+                        "kind": "initial_foreign_source",
+                        "well": rule.well,
+                        "sample_id": observed["sample_id"],
+                        "lot_id": observed["lot_id"],
+                    }
+                ],
+                "blockable": False,
+            }
+        return {"event": None, "chain": [], "blockable": True}
+
     def run(self) -> dict[str, Any]:
         self.initialize()
         peak_snapshots: dict[tuple[str, Optional[str]], dict[str, Any]] = {}
         threshold_events: list[dict[str, Any]] = []
+        source_peak: dict[str, dict[str, Any]] = {}
+        source_events: list[dict[str, Any]] = []
 
         def observe(snapshots: list[dict[str, Any]]) -> None:
             for snap in snapshots:
@@ -877,7 +1172,17 @@ class Simulator:
                 if not snap["qualified"]:
                     threshold_events.append(snap)
 
+        def observe_source(snapshots: list[dict[str, Any]]) -> None:
+            for snap in snapshots:
+                key = snap["well"]
+                old = source_peak.get(key)
+                if old is None or snap["foreign_fraction"] > old["foreign_fraction"]:
+                    source_peak[key] = dict(snap)
+                if not snap["qualified"]:
+                    source_events.append(snap)
+
         observe(self.evaluate_targets(None, None))
+        observe_source(self.evaluate_source_targets(None, None))
         for index, step in enumerate(self.program.steps):
             if step.type == "aspirate":
                 self.run_aspirate(step, index)
@@ -890,6 +1195,7 @@ class Simulator:
             elif step.type == "change_tip":
                 self.run_change_tip(step, index)
             observe(self.evaluate_targets(step.id, index))
+            observe_source(self.evaluate_source_targets(step.id, index))
 
         target_results = []
         first_by_step = {}
@@ -927,16 +1233,69 @@ class Simulator:
                 }
             )
 
+        first_source_violation: dict[str, dict[str, Any]] = {}
+        for event in source_events:
+            first_source_violation.setdefault(event["well"], event)
+
+        source_target_results = []
+        for rule in self.source_targets:
+            well = rule.well
+            peak = source_peak.get(well)
+            initial = self.evaluate_initial_source_snapshot(rule)
+            final_candidates = [s for s in self.evaluate_source_targets() if s["well"] == well]
+            final = final_candidates[0]
+            first_violation = first_source_violation.get(well)
+            observed = (peak or {}).get("observed_foreign_source")
+            chain = self.source_chain_for(rule, observed)
+            foreign_chains = []
+            for entry in (peak or {}).get("composition", {}).get("foreign", []):
+                entry_chain = self.source_chain_for(rule, entry)
+                foreign_chains.append(
+                    {
+                        "sample_id": entry["sample_id"],
+                        "lot_id": entry["lot_id"],
+                        "volume": entry["volume"],
+                        "first_contamination": entry_chain["event"],
+                        "propagation_chain": entry_chain["chain"],
+                        "blockable": entry_chain["blockable"],
+                    }
+                )
+            source_target_results.append(
+                {
+                    "well": well,
+                    "allowed_sources": self.serialize_allowed_sources(rule),
+                    "max_foreign_fraction": rule.max_foreign_fraction,
+                    "qualified": final["qualified"] and (peak["qualified"] if peak else True),
+                    "peak": peak,
+                    "initial": initial,
+                    "final": final,
+                    "first_threshold_violation": first_violation,
+                    "first_contamination": chain["event"],
+                    "propagation_chain": chain["chain"],
+                    "foreign_source_chains": foreign_chains,
+                    "blockable": chain["blockable"],
+                    "calculation_basis": {
+                        "threshold_rule": "maximum observed foreign-source fraction across initial state and every step",
+                        "numerator": peak["foreign_volume"] if peak else 0.0,
+                        "denominator": peak["well_volume"] if peak else 0.0,
+                        "fraction": peak["foreign_fraction"] if peak else 0.0,
+                    },
+                }
+            )
+
         return {
             "program": self.program.name,
             "status": "completed",
-            "summary": self.summary(target_results),
+            "summary": self.summary(target_results, source_target_results),
             "findings": self.findings,
             "cross_contamination": {
                 "events": self.cross_events,
                 "first_by_well_component": list(self.first_cross.values()),
+                "source_events": self.source_cross_events,
+                "first_by_well_source": list(self.first_source_cross.values()),
             },
             "target_results": target_results,
+            "source_target_results": source_target_results,
             "final_wells": {well: self.well_snapshot(well) for well in sorted(self.wells)},
             "final_tips": {tip: self.tip_snapshot(tip) for tip in sorted(self.tip_packets)},
             "trace": self.trace if self.report_trace else [],
@@ -982,18 +1341,35 @@ class Simulator:
             }
         return {"event": None, "chain": [], "blockable": True}
 
-    def summary(self, target_results: list[dict[str, Any]]) -> dict[str, Any]:
+    def summary(
+        self,
+        target_results: list[dict[str, Any]],
+        source_target_results: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        source_target_results = source_target_results or []
         return {
             "runtime_errors": sum(1 for f in self.findings if f["severity"] == "error"),
             "warnings": sum(1 for f in self.findings if f["severity"] == "warning"),
             "cross_contamination_events": len(self.cross_events),
+            "source_cross_contamination_events": len(self.source_cross_events),
             "targets_qualified": sum(1 for t in target_results if t["qualified"]),
             "targets_total": len(target_results),
-            "all_targets_qualified": all(t["qualified"] for t in target_results) if target_results else None,
+            "source_targets_qualified": sum(1 for t in source_target_results if t["qualified"]),
+            "source_targets_total": len(source_target_results),
+            "all_targets_qualified": (
+                all(t["qualified"] for t in target_results)
+                and all(t["qualified"] for t in source_target_results)
+                if (target_results or source_target_results)
+                else None
+            ),
         }
 
 
-def _filtered_exposure_edges(sim: Simulator, targets: list[TargetThreshold]) -> tuple[list[tuple[int, float]], bool]:
+def _filtered_exposure_edges(
+    sim: Simulator,
+    targets: list[TargetThreshold],
+    source_targets: Optional[list[SourceThresholdInput]] = None,
+) -> tuple[list[tuple[int, float]], bool]:
     edges: list[tuple[int, float]] = []
     unblockable = False
     for target in targets:
@@ -1014,16 +1390,36 @@ def _filtered_exposure_edges(sim: Simulator, targets: list[TargetThreshold]) -> 
             if event:
                 node = sim.graph.nodes[event["arrival_node"]]
                 edges.append((node, GRAPH_INF))
+
+    # Provenance-level failures are cut at the same tip boundaries; the graph
+    # carries source identity on every packet, so arrival nodes already encode
+    # the offending sample/lot even when component names are identical.
+    for rule in source_targets or []:
+        initial = sim.evaluate_initial_source_snapshot(rule)
+        if not initial["qualified"]:
+            unblockable = True
+        source_events = [e for e in sim.first_source_cross.values() if e["target_well"] == rule.well]
+        for event in source_events:
+            node = sim.graph.nodes[event["arrival_node"]]
+            edges.append((node, GRAPH_INF))
     return edges, (unblockable or False)
+
+
+def _all_qualified(result: dict[str, Any]) -> bool:
+    return all(t["qualified"] for t in result["target_results"]) and all(
+        t["qualified"] for t in result["source_target_results"]
+    )
 
 
 def find_minimum_blockers(
     program: ProgramInput,
     targets: list[TargetThreshold],
     max_candidates: int = 40,
+    source_targets: Optional[list[SourceThresholdInput]] = None,
 ) -> dict[str, Any]:
-    baseline = Simulator(program, targets, report_trace=False).run()
-    if all(t["qualified"] for t in baseline["target_results"]):
+    source_targets = source_targets or []
+    baseline = Simulator(program, targets, report_trace=False, source_targets=source_targets).run()
+    if _all_qualified(baseline):
         return {
             "required_count": 0,
             "actions": [],
@@ -1032,7 +1428,7 @@ def find_minimum_blockers(
             "calculation_basis": "All targets already satisfy their thresholds.",
         }
 
-    sim = Simulator(program, targets, report_trace=False)
+    sim = Simulator(program, targets, report_trace=False, source_targets=source_targets)
     sim.initialize()
     for index, step in enumerate(program.steps):
         if step.type == "aspirate":
@@ -1050,14 +1446,14 @@ def find_minimum_blockers(
     if len(candidate_items) > max_candidates:
         candidate_items = candidate_items[:max_candidates]
     candidate_node_set = {node for node, _ in candidate_items}
-    sink_edges, initial_unblockable = _filtered_exposure_edges(sim, targets)
+    sink_edges, initial_unblockable = _filtered_exposure_edges(sim, targets, source_targets)
     if initial_unblockable:
         return {
             "required_count": None,
             "actions": [],
             "qualified": False,
             "optimality": "infeasible",
-            "calculation_basis": "Contamination is present in the initial target liquid and cannot be removed by a later tip action.",
+            "calculation_basis": "Contamination (foreign component or disallowed source) is present in the initial target liquid and cannot be removed by a later tip action.",
         }
     if not sink_edges:
         return {
@@ -1106,7 +1502,13 @@ def find_minimum_blockers(
         for item in strict_cut
     ]
     strict_interventions = {a["before_step_id"]: "clear_tip" for a in strict_actions}
-    strict_verified = Simulator(program, targets, strict_interventions, report_trace=False).run()
+    strict_verified = Simulator(
+        program,
+        targets,
+        strict_interventions,
+        report_trace=False,
+        source_targets=source_targets,
+    ).run()
 
     # The vertex cut is the minimum number of actions that completely sever every
     # contamination path. For a non-zero threshold, fewer partial interventions may
@@ -1134,8 +1536,14 @@ def find_minimum_blockers(
         for k in range(0, strict_k):
             for combo in combinations(range(len(candidate_actions)), k):
                 interventions = {candidate_actions[i]["before_step_id"]: "clear_tip" for i in combo}
-                result = Simulator(program, targets, interventions, report_trace=False).run()
-                if all(t["qualified"] for t in result["target_results"]):
+                result = Simulator(
+                    program,
+                    targets,
+                    interventions,
+                    report_trace=False,
+                    source_targets=source_targets,
+                ).run()
+                if _all_qualified(result):
                     threshold_solution = ([candidate_actions[i] for i in combo], result)
                     break
             if threshold_solution:
@@ -1151,7 +1559,7 @@ def find_minimum_blockers(
     return {
         "required_count": len(actions),
         "actions": actions,
-        "qualified": all(t["qualified"] for t in verified["target_results"]),
+        "qualified": _all_qualified(verified),
         "verified_result_summary": verified["summary"],
         "introduced_runtime_findings": [
             finding
@@ -1175,5 +1583,11 @@ def run_review(
     program: ProgramInput,
     targets: Optional[list[TargetThreshold]] = None,
     report_trace: bool = True,
+    source_targets: Optional[list[SourceThresholdInput]] = None,
 ) -> dict[str, Any]:
-    return Simulator(program, targets or [], report_trace=report_trace).run()
+    return Simulator(
+        program,
+        targets or [],
+        report_trace=report_trace,
+        source_targets=source_targets or [],
+    ).run()
