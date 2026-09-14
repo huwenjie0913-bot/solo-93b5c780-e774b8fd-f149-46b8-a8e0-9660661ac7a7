@@ -671,11 +671,10 @@ class Simulator:
                 "actual_volume": packet.volume,
             }
             moved = self.clone_packet(packet, packet.volume, drawn_node, event)
-            # Liquid drawn from the source well enters the tip *through* this
-            # step's boundary; cutting it (fresh tip / full wash) must prevent
-            # source-well liquid from joining the tip's prior contents.
-            self.graph.add_edge(packet.node, boundary)
-            self.graph.add_edge(boundary, drawn_node)
+            # Liquid freshly drawn from the source well bypasses this step's
+            # tip boundary: a change_tip / full-wash only clears the tip's prior
+            # contents, it cannot stop liquid that is aspirated in this very step.
+            self.graph.add_edge(packet.node, drawn_node)
             self.put_tip_packet(tip, moved)
 
         self.trace.append(
@@ -1473,7 +1472,11 @@ def find_minimum_blockers(
             "actions": [],
             "qualified": False,
             "optimality": "infeasible",
-            "calculation_basis": "The minimum-cut network contains an uncuttable infinite-capacity path.",
+            "calculation_basis": (
+                "The offending liquid reaches the target through an uncuttable infinite-capacity "
+                "path (for example it is aspirated and directly dispensed in the same transfer); "
+                "no tip change or wash boundary can sever it."
+            ),
         }
     reachable = dinic.reachable()
 
@@ -1555,6 +1558,46 @@ def find_minimum_blockers(
     else:
         actions, verified = strict_actions, strict_verified
         optimality = "minimum_strict_block" if not exact_threshold else "minimum_strict_block_threshold_exact"
+
+    # A recommendation is only valid if re-running the program with it actually
+    # clears every threshold. The min-cut models tip-carryover boundaries; if a
+    # strict block still leaves a violation (e.g. liquid is directly aspirated
+    # from the offending source and dispensed into the target), no finite set of
+    # tip actions can help and we must not return a misleading suggestion.
+    if not _all_qualified(verified):
+        remaining = [
+            {
+                "well": result["well"],
+                "component": result.get("component"),
+                "peak_fraction": (
+                    result["peak"]["contamination_fraction"]
+                    if result.get("peak") else 0.0
+                ),
+            }
+            for result in verified["target_results"]
+            if not result["qualified"]
+        ] + [
+            {
+                "well": result["well"],
+                "component": None,
+                "peak_fraction": result["peak"]["foreign_fraction"] if result.get("peak") else 0.0,
+            }
+            for result in verified["source_target_results"]
+            if not result["qualified"]
+        ]
+        return {
+            "required_count": None,
+            "actions": [],
+            "qualified": False,
+            "optimality": "infeasible",
+            "calculation_basis": (
+                "No tip change or full wash clears the violation on re-simulation: the offending "
+                "liquid reaches the target through the transfer itself rather than tip carryover, "
+                "so candidate boundary actions cannot prevent it."
+            ),
+            "rejected_candidate_count": len(actions),
+            "remaining_violations": remaining,
+        }
 
     return {
         "required_count": len(actions),

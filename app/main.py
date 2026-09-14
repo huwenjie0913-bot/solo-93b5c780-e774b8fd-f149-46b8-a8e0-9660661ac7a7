@@ -90,18 +90,25 @@ def compare(request: CompareRequest) -> dict[str, Any]:
             + [{"version": "B", **error} for error in errors_b]
         )
 
-    source_target_keys = request_source_targets(request.version_a, request_sources)
-    source_key_list = [t.well for t in source_target_keys]
+    effective_sources_a = request_source_targets(request.version_a, request_sources)
+    effective_sources_b = request_source_targets(request.version_b, request_sources)
+    # Compare against the union of the two versions' source rules: a rule may
+    # exist only on version B, in which case version A is still reviewed with
+    # its own rules and the missing side is reported instead of dropping the row.
+    source_wells: list[str] = []
+    for rule in list(effective_sources_a) + list(effective_sources_b):
+        if rule.well not in source_wells:
+            source_wells.append(rule.well)
 
     result_a = run_review(
         request.version_a,
         request_targets(request.version_a, request.targets),
-        source_targets=request_source_targets(request.version_a, request_sources),
+        source_targets=effective_sources_a,
     )
     result_b = run_review(
         request.version_b,
         request_targets(request.version_b, request.targets),
-        source_targets=request_source_targets(request.version_b, request_sources),
+        source_targets=effective_sources_b,
     )
 
     keys = request_targets(request.version_a, request.targets)
@@ -133,7 +140,7 @@ def compare(request: CompareRequest) -> dict[str, Any]:
     source_map_a = {t["well"]: t for t in result_a["source_target_results"]}
     source_map_b = {t["well"]: t for t in result_b["source_target_results"]}
     source_comparison = []
-    for well in source_key_list:
+    for well in source_wells:
         a = source_map_a.get(well)
         b = source_map_b.get(well)
         source_comparison.append(
@@ -176,15 +183,42 @@ def compare(request: CompareRequest) -> dict[str, Any]:
         "version_b": _compact_result(result_b),
         "target_comparison": target_comparison,
         "source_comparison": source_comparison,
-        "overall_judgment": {
-            "a_all_qualified": bool(result_a["summary"]["all_targets_qualified"]),
-            "b_all_qualified": bool(result_b["summary"]["all_targets_qualified"]),
-            "b_improves_all_failed_targets": all(
-                row["judgment"] != "B_WORSE" for row in target_comparison
-            )
-            and all(row["judgment"] != "B_WORSE" for row in source_comparison),
-        },
+        "overall_judgment": _overall_judgment(
+            result_a, result_b, target_comparison, source_comparison
+        ),
         "blockers_for_b": blockers_b,
+    }
+
+
+def _overall_judgment(result_a, result_b, target_comparison, source_comparison) -> dict[str, Any]:
+    # "improves all failed targets" means: every target that version A failed is
+    # qualified in B, and B introduces no new failure (component or source rule).
+    def a_failed_now_passes(rows: list[dict[str, Any]]) -> bool:
+        for row in rows:
+            a_qualified = row["version_a_qualified"]
+            b_qualified = row["version_b_qualified"]
+            if a_qualified is False and b_qualified is not True:
+                return False
+        return True
+
+    def no_new_b_failures(rows: list[dict[str, Any]]) -> bool:
+        for row in rows:
+            if row["version_a_qualified"] is not False and row["version_b_qualified"] is False:
+                return False
+        return True
+
+    component_rows = target_comparison
+    source_rows = source_comparison
+    improves = (
+        a_failed_now_passes(component_rows)
+        and a_failed_now_passes(source_rows)
+        and no_new_b_failures(component_rows)
+        and no_new_b_failures(source_rows)
+    )
+    return {
+        "a_all_qualified": bool(result_a["summary"]["all_targets_qualified"]),
+        "b_all_qualified": bool(result_b["summary"]["all_targets_qualified"]),
+        "b_improves_all_failed_targets": improves,
     }
 
 
@@ -203,8 +237,15 @@ def _comparison_judgment(a: dict[str, Any] | None, b: dict[str, Any] | None) -> 
 
 
 def _source_comparison_judgment(a: dict[str, Any] | None, b: dict[str, Any] | None) -> str:
-    if not a or not b:
+    # A rule may exist on only one version. A newly added rule that fails is a
+    # regression B exposes, not an improvement; dropping a failed rule likewise
+    # does not make B better.
+    if a is None and b is None:
         return "MISSING_TARGET"
+    if a is None:
+        return "IDENTICAL" if b["qualified"] else "B_WORSE"
+    if b is None:
+        return "IDENTICAL" if a["qualified"] else "B_WORSE"
     fa = a["peak"]["foreign_fraction"] if a.get("peak") else 0.0
     fb = b["peak"]["foreign_fraction"] if b.get("peak") else 0.0
     if a["qualified"] == b["qualified"] and abs(fa - fb) < 1e-12:

@@ -444,6 +444,83 @@ def test_initial_foreign_source_violation_is_unblockable():
     assert blockers["qualified"] is False
 
 
+def test_direct_transfer_is_infeasible_and_no_invalid_wash_is_suggested():
+    # S1 DNA is aspirated from A1 and dispensed straight into B2 (S2 only).
+    # A pre-aspiration wash cannot stop liquid that is itself aspirated.
+    direct_initials = [
+        initial_source("A1", 100.0, "DNA", sample_id="S1"),
+        initial_source("B2", 100.0, "DNA", sample_id="S2"),
+    ]
+    direct_steps = [
+        step(1, "aspirate", source="A1", volume=100, residual_rate=0.1),
+        step(2, "dispense", target="B2", volume=100, residual_rate=0.1),
+    ]
+    rule = source_target("B2", [allowed(sample_id="S2")])
+    program = source_program("direct", direct_steps, direct_initials)
+
+    review = run_review(program, source_targets=[rule])
+    source_result = review["source_target_results"][0]
+    assert source_result["qualified"] is False
+    assert source_result["first_threshold_violation"]["step_id"] == 2
+
+    blockers = find_minimum_blockers(program, [], source_targets=[rule])
+    # No finite set of tip actions helps: the solver must say so explicitly and
+    # never return a minimum_strict_block recommendation that still fails.
+    assert blockers["optimality"] == "infeasible"
+    assert blockers["required_count"] is None
+    assert blockers["actions"] == []
+    assert blockers["qualified"] is False
+
+    # And even if a boundary candidate were cut, re-simulation confirms it fails:
+    verified = Simulator(
+        program, [], interventions={1: "clear_tip"}, report_trace=False,
+        source_targets=[rule],
+    ).run()
+    assert verified["source_target_results"][0]["qualified"] is False
+
+
+def test_compare_union_of_rules_and_real_results_when_rule_only_on_b():
+    # The source rule is declared only on version B. The comparison must still
+    # include the well (union of both versions' rules) and use the real review
+    # results, so a failing B cannot report b_improves_all_failed_targets.
+    direct_initials = [
+        initial_source("A1", 100.0, "DNA", sample_id="S1"),
+        initial_source("B2", 100.0, "DNA", sample_id="S2"),
+    ]
+    direct_steps = [
+        step(1, "aspirate", source="A1", volume=100, residual_rate=0.1),
+        step(2, "dispense", target="B2", volume=100, residual_rate=0.1),
+    ]
+    rule = source_target("B2", [allowed(sample_id="S2")])
+    prog_a = source_program("A", direct_steps, direct_initials)
+    prog_b = source_program("B", direct_steps, direct_initials)
+    prog_b.source_targets = [rule]
+
+    request = SimpleNamespace(
+        version_a=prog_a,
+        version_b=prog_b,
+        targets=[],
+        source_targets=[],
+        find_blockers=False,
+        max_blocker_candidates=40,
+    )
+    result = compare(request)
+
+    # Union row exists even though version A had no rule.
+    assert len(result["source_comparison"]) == 1
+    row = result["source_comparison"][0]
+    assert row["well"] == "B2"
+    assert row["version_a_qualified"] is None
+    assert row["version_b_qualified"] is False
+    assert row["judgment"] == "B_WORSE"
+    # B is not all-qualified and it did not improve any A failure.
+    assert result["overall_judgment"] == {
+        "a_all_qualified": False,
+        "b_all_qualified": False,
+        "b_improves_all_failed_targets": False,
+    }
+
+
 def test_minimum_blocker_clears_same_name_residual_before_step_3():
     blockers = find_minimum_blockers(
         source_program("bad", BASE_STEPS, SAME_NAME_INITIALS),
