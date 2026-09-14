@@ -101,6 +101,10 @@ def _finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
+def _positive_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def validation_error(
     code: str,
     message: str,
@@ -127,8 +131,8 @@ def plate_wells(plate: PlateTypeInput) -> dict[str, float]:
     if plate.kind == "custom":
         return dict(plate.custom_wells or {})
 
-    rows = plate.rows or 0
-    columns = plate.columns or 0
+    rows = int(plate.rows or 0)
+    columns = int(plate.columns or 0)
     return {
         f"{chr(ord('A') + r)}{c + 1}": plate.well_capacity
         for r in range(rows)
@@ -171,9 +175,9 @@ def validate_program(program: ProgramInput, extra_targets: Optional[list[TargetT
                     )
                 )
     else:
-        if not _finite_number(plate.rows) or plate.rows is None or plate.rows <= 0:
+        if not _positive_integer(plate.rows):
             errors.append(validation_error("INVALID_PLATE_DIMENSION", "rows must be a positive integer.", "plate.rows"))
-        if not _finite_number(plate.columns) or plate.columns is None or plate.columns <= 0:
+        if not _positive_integer(plate.columns):
             errors.append(validation_error("INVALID_PLATE_DIMENSION", "columns must be a positive integer.", "plate.columns"))
         if not _finite_number(plate.well_capacity) or plate.well_capacity <= 0:
             errors.append(validation_error("INVALID_PLATE_CAPACITY", "well_capacity must be positive.", "plate.well_capacity"))

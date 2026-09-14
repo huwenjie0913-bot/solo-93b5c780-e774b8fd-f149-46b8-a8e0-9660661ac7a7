@@ -49,9 +49,9 @@ class Graph:
         self.edges.append(edge)
 
     def build_flow_network(self, sink_edges: list[tuple[int, float]], candidate_nodes: set[int]):
-        next_id = len(self.nodes) + 1
         mapping: dict[int, int] = {}
         split_out: dict[int, int] = {}
+        next_id = 0
 
         def mapped(old: int) -> int:
             nonlocal next_id
@@ -60,15 +60,15 @@ class Graph:
                 next_id += 1
             return mapping[old]
 
-        # Original nodes plus one output vertex for each unit-capacity candidate,
-        # plus the super sink.
-        capacity = 2 * len(self.nodes) + len(candidate_nodes) + 1
-        adjacency: list[list[dict[str, Any]]] = [[] for _ in range(capacity)]
-
         source = mapped(self.source)
-        sink = 2 * len(self.nodes) + len(candidate_nodes)
+        sink = len(self.nodes)
+        next_id = sink + 1
+        adjacency: list[list[dict[str, Any]]] = [[] for _ in range(sink + 1)]
 
         def add_flow_edge(u: int, v: int, cap: float, original: Optional[dict[str, Any]] = None) -> None:
+            needed = max(u, v) + 1
+            if len(adjacency) < needed:
+                adjacency.extend([] for _ in range(needed - len(adjacency)))
             forward = {"to": v, "rev": len(adjacency[v]), "cap": float(cap), "original": original}
             backward = {"to": u, "rev": len(adjacency[u]), "cap": 0.0, "original": None}
             adjacency[u].append(forward)
@@ -80,10 +80,7 @@ class Graph:
                 vout = next_id
                 next_id += 1
                 split_out[old_node] = vout
-                adjacency.extend([] for _ in range(vout + 1 - len(adjacency)))
                 add_flow_edge(vin, vout, 1.0, {"kind": "candidate_split", "node": old_node})
-            else:
-                add_flow_edge(vin, vin, GRAPH_INF) if False else None
 
         # Every non-candidate node has unlimited capacity. A self-edge is not useful,
         # so original edges are remapped directly through candidate vout where needed.
@@ -181,6 +178,8 @@ class Simulator:
         }
         self.tip_packets: dict[str, dict[tuple[str, int], Packet]] = {}
         self.native_components: dict[str, set[str]] = {well: set() for well in self.wells}
+        self.initial_components: dict[str, dict[str, float]] = {well: {} for well in self.wells}
+        self.initial_volumes: dict[str, float] = {well: 0.0 for well in self.wells}
         self.findings: list[dict[str, Any]] = []
         self.trace: list[dict[str, Any]] = []
         self.cross_events: list[dict[str, Any]] = []
@@ -321,8 +320,8 @@ class Simulator:
                 self.graph.add_edge(self.graph.source, node, GRAPH_INF, {"kind": "initial_lot"})
                 self.put_well_packet(well, packet)
                 self.native_components[well].add(name)
-                if name not in self.native_components.get("__initial_targets__", set()):
-                    pass
+                self.initial_components[well][name] = self.initial_components[well].get(name, 0.0) + volume
+                self.initial_volumes[well] += volume
 
         # The simulation graph is built from initial packets and every packet
         # transfer; target threshold evaluation determines the sink edges.
@@ -524,16 +523,9 @@ class Simulator:
         rate: float,
         mechanism: str,
         cycle: Optional[int] = None,
-        start_node_name: Optional[str] = None,
     ) -> tuple[float, float, float]:
         tip_before = self.tip_total(tip)
         d = min(1.0, requested / tip_before) if tip_before > EPS else 0.0
-        start: Optional[int] = None
-        if d > EPS:
-            start_name = start_node_name or f"tip:{tip}:dispense-start:{step.id}"
-            start = self.graph.node(start_name)
-            for packet in self.tip_packets[tip].values():
-                self.graph.add_edge(packet.node, start)
 
         delivered_packets: list[Packet] = []
         residual_store: dict[tuple[str, int], Packet] = {}
@@ -558,7 +550,7 @@ class Simulator:
                 "residual_rate": rate,
             }
             delivered = self.clone_packet(packet, delivered_volume, out_node, event)
-            self.graph.add_edge(start, out_node)
+            self.graph.add_edge(packet.node, out_node)
             delivered_packets.append(delivered)
 
             if residual_volume > 1e-11:
@@ -574,7 +566,7 @@ class Simulator:
                     "residual_rate": rate,
                 }
                 residual = self.clone_packet(packet, residual_volume, residual_node, residual_event)
-                self.graph.add_edge(start, residual_node)
+                self.graph.add_edge(packet.node, residual_node)
                 residual_store[(residual.lot, residual.node)] = residual
         old_store.clear()
         for packet in residual_store.values():
@@ -766,7 +758,6 @@ class Simulator:
                 rate,
                 "mix_return",
                 cycle,
-                start_node_name=f"tip:{tip}:mix-return-start:{step.id}:{cycle}",
             )
 
         if self.program.tip_strategy.mode == "new_per_transfer":
@@ -958,8 +949,8 @@ class Simulator:
         }
 
     def evaluate_initial_snapshot(self, target: TargetThreshold) -> dict[str, Any]:
-        volume = self.well_total(target.well)
-        components = self.component_totals(self.well_packets[target.well])
+        volume = self.initial_volumes[target.well]
+        components = self.initial_components[target.well]
         native = self.native_components[target.well]
         if target.component is None:
             numerator = sum(v for name, v in components.items() if name not in native)
@@ -1005,7 +996,6 @@ class Simulator:
 def _filtered_exposure_edges(sim: Simulator, targets: list[TargetThreshold]) -> tuple[list[tuple[int, float]], bool]:
     edges: list[tuple[int, float]] = []
     unblockable = False
-    target_wells = {t.well for t in targets}
     for target in targets:
         snapshot = None
         for candidate in sim.evaluate_targets():

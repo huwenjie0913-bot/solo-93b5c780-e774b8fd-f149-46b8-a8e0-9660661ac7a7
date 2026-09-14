@@ -75,7 +75,7 @@ def compare(request: CompareRequest) -> dict[str, Any]:
         )
 
     result_a = run_review(request.version_a, request_targets(request.version_a, request.targets))
-    result_b = run_review(request.version_b, request.targets(request.version_b, request.targets))
+    result_b = run_review(request.version_b, request_targets(request.version_b, request.targets))
 
     keys = request_targets(request.version_a, request.targets)
     key_list = [(t.well, t.component) for t in keys]
